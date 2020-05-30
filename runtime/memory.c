@@ -15,10 +15,13 @@
 
 #define CAML_INTERNALS
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "caml/address_class.h"
 #include "caml/config.h"
 #include "caml/fail.h"
@@ -48,6 +51,84 @@ uintnat caml_use_huge_pages = 0;
 */
 
 extern uintnat caml_percent_free;                   /* major_gc.c */
+
+/**********************************************/
+
+#define Is_power_2(align) \
+  ((align) != 0 && ((align) & ((align)-1)) == 0)
+
+static uintnat round_up(uintnat size, uintnat align)
+{
+  CAMLassert(Is_power_2(align));
+  return (size + align - 1) & ~(align - 1);
+}
+void caml_mem_unmap(void *mem, uintnat size)
+{
+  munmap(mem, size);
+}
+static void *map_fixed(void *mem, uintnat size, int prot)
+{
+  if (mmap((void *)mem, size, prot,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+           -1, 0) == MAP_FAILED)
+  {
+    fprintf(stderr, "errno: %d\n", errno);
+    return 0;
+  }
+  else
+  {
+    return mem;
+  }
+}
+void *caml_mem_commit(void *mem, uintnat size)
+{
+  void *p = map_fixed(mem, size, PROT_READ | PROT_WRITE);
+  /*
+    FIXME: On Linux, with overcommit, you stand a better
+    chance of getting good error messages in OOM conditions
+    by forcing the kernel to allocate actual memory by touching
+    all the pages. Not sure whether this is a good idea, though.
+
+      if (p) memset(p, 0, size);
+  */
+  return p;
+}
+
+void caml_mem_decommit(void *mem, uintnat size)
+{
+  map_fixed(mem, size, PROT_NONE);
+}
+
+uintnat caml_mem_round_up_pages(uintnat size)
+{
+  return round_up(size, sysconf(_SC_PAGESIZE));
+}
+
+void *caml_mem_map(uintnat size, uintnat alignment, int reserve_only)
+{
+  uintnat alloc_sz = caml_mem_round_up_pages(size + alignment);
+  void *mem;
+  uintnat base, aligned_start, aligned_end;
+
+  CAMLassert(Is_power_2(alignment));
+  alignment = caml_mem_round_up_pages(alignment);
+
+  CAMLassert(alloc_sz > size);
+  mem = mmap(0, alloc_sz, reserve_only ? PROT_NONE : (PROT_READ | PROT_WRITE),
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mem == MAP_FAILED)
+  {
+    return 0;
+  }
+  /* trim to an aligned region */
+  base = (uintnat)mem;
+  aligned_start = round_up(base, alignment);
+  aligned_end = aligned_start + caml_mem_round_up_pages(size);
+  caml_mem_unmap((void *)base, aligned_start - base);
+  caml_mem_unmap((void *)aligned_end, (base + alloc_sz) - aligned_end);
+  return (void *)aligned_start;
+}
+/**********************************************/
 
 /* Page table management */
 
@@ -86,6 +167,7 @@ static struct page_table caml_page_table;
 #define HASH_FACTOR 2654435769UL
 #endif
 #define Hash(v) (((v) * HASH_FACTOR) >> caml_page_table.shift)
+
 
 int caml_page_table_lookup(void * addr)
 {
@@ -249,8 +331,26 @@ int caml_page_table_remove(int kind, void * start, void * end)
    is a hp, but the header (and the contents) must be initialized by the
    caller.
 */
-char *caml_alloc_for_heap (asize_t request)
+CAMLextern char *caml_heap_base;
+CAMLextern char *caml_heap_start;
+CAMLextern char *caml_heap_end;
+CAMLextern char *caml_heap_reserve_end;
+char *caml_alloc_for_heap(asize_t request)
 {
+
+#ifdef NO_PAGE_TABLE
+  uintnat size = Round_mmap_size(sizeof(heap_chunk_head) + request);
+  void *block;
+  char *mem;
+  block = caml_mem_commit(caml_heap_end, size);
+  caml_heap_end += size;
+  if (block == NULL)
+    return NULL;
+  mem = (char *)block + sizeof(heap_chunk_head);
+  Chunk_size(mem) = size - sizeof(heap_chunk_head);
+  Chunk_block(mem) = block;
+  return mem;
+#else
   if (caml_use_huge_pages){
 #ifdef HAS_HUGE_PAGES
     uintnat size = Round_mmap_size (sizeof (heap_chunk_head) + request);
@@ -279,6 +379,7 @@ char *caml_alloc_for_heap (asize_t request)
     Chunk_block (mem) = block;
     return mem;
   }
+#endif
 }
 
 /* Use this function if a block allocated with [caml_alloc_for_heap] is
@@ -295,6 +396,10 @@ void caml_disown_for_heap (char* mem)
 */
 void caml_free_for_heap (char *mem)
 {
+#ifdef NO_PAGE_TABLE
+  /* Currently a no-op. */
+  (void)mem; /* can CAMLunused_{start,end} be used here? */
+#else
   if (caml_use_huge_pages){
 #ifdef HAS_HUGE_PAGES
     munmap (Chunk_block (mem), Chunk_size (mem) + sizeof (heap_chunk_head));
@@ -304,6 +409,7 @@ void caml_free_for_heap (char *mem)
   }else{
     caml_stat_free (Chunk_block (mem));
   }
+#endif
 }
 
 /* Take a chunk of memory as argument, which must be the result of a
@@ -327,9 +433,11 @@ int caml_add_to_heap (char *m)
                    ARCH_INTNAT_PRINTF_FORMAT "uk bytes\n",
      (Bsize_wsize (Caml_state->stat_heap_wsz) + Chunk_size (m)) / 1024);
 
+#ifndef NO_PAGE_TABLE
   /* Register block in page table */
   if (caml_page_table_add(In_heap, m, m + Chunk_size(m)) != 0)
     return -1;
+#endif
 
   /* Chain this heap chunk. */
   {
@@ -448,9 +556,10 @@ void caml_shrink_heap (char *chunk)
   while (*cp != chunk) cp = &(Chunk_next (*cp));
   *cp = Chunk_next (chunk);
 
+#ifndef NO_PAGE_TABLE
   /* Remove the pages of [chunk] from the page table. */
   caml_page_table_remove(In_heap, chunk, chunk + Chunk_size (chunk));
-
+#endif
   /* Free the [malloc] block that contains [chunk]. */
   caml_free_for_heap (chunk);
 }
@@ -758,7 +867,7 @@ static struct pool_block* get_pool_block(caml_stat_block b)
 
   else {
     struct pool_block *pb =
-      (struct pool_block*)(((char*)b) - SIZEOF_POOL_BLOCK);
+        (struct pool_block*)(((char*)b) - SIZEOF_POOL_BLOCK);
 #ifdef DEBUG
     CAMLassert(pb->magic == Debug_pool_magic);
 #endif

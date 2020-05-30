@@ -257,4 +257,5 @@ typedef uint64_t uintnat;
    Documented in gc.mli */
 #define Custom_minor_max_bsz_def 8192
 
+#define NO_PAGE_TABLE
 #endif /* CAML_CONFIG_H */

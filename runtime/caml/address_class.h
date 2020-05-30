@@ -25,6 +25,27 @@
 /* Use the following macros to test an address for the different classes
    it might belong to. */
 
+#ifdef NO_PAGE_TABLE
+
+#define Is_young(val) \
+  (CAMLassert (Is_block ((value)val)), \
+   (char *)(val) < (char *)Caml_state_field(young_end) && \
+   (char *)(val) > (char *)Caml_state_field(young_start))
+
+CAMLextern char *caml_heap_start;
+CAMLextern char *caml_heap_end;
+#define Is_in_heap(val)                       \
+  (CAMLassert(Is_block((value)val)),                 \
+   (char *)(val) < (char *)(caml_heap_end) && \
+       (char *)(val) > (char *)(caml_heap_start))
+
+#define Is_in_heap_or_young(a) (Is_young(a) || Is_in_heap(a))
+
+#define Is_in_value_area(a) \
+  (Is_in_heap_or_young(a) || Is_in_static_data(a))
+
+#else
+
 #define Is_young(val) \
   (CAMLassert (Is_block (val)), \
    (char *)(val) < (char *)Caml_state_field(young_end) && \
@@ -36,6 +57,7 @@
 
 #define Is_in_value_area(a)                                     \
   (Classify_addr(a) & (In_heap | In_young | In_static_data))
+#endif
 
 #define Is_in_code_area(pc) \
  (    ((char *)(pc) >= caml_code_area_start && \
@@ -49,9 +71,11 @@
 
 extern char * caml_code_area_start, * caml_code_area_end;
 
+#ifndef NO_PAGE_TABLE
 #define Not_in_heap 0
 #define In_heap 1
 #define In_young 2
+#endif
 #define In_static_data 4
 #define In_code_area 8
 

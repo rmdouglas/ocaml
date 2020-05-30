@@ -79,7 +79,8 @@ typedef void* caml_stat_block;
 
 #ifdef CAML_INTERNALS
 
-/* The pool must be initialized with a call to [caml_stat_create_pool]
+CAMLextern void *caml_mem_map(uintnat, uintnat, int);
+    /* The pool must be initialized with a call to [caml_stat_create_pool]
    before it is possible to use any of the [caml_stat_*] functions below.
 
    If the pool is not initialized, [caml_stat_*] functions will still work in

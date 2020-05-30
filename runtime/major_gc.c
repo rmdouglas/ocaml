@@ -50,6 +50,12 @@ Caml_inline double fmin(double a, double b) {
 uintnat caml_percent_free;
 uintnat caml_major_heap_increment;
 CAMLexport char *caml_heap_start;
+#ifdef NO_PAGE_TABLE
+CAMLexport char* caml_heap_base;
+CAMLexport char *caml_heap_end;
+CAMLexport char *caml_heap_reserve_end;
+CAMLexport heap_chunk_head *caml_heap_free;
+#endif
 char *caml_gc_sweep_hp;
 int caml_gc_phase;        /* always Phase_mark, Pase_clean,
                              Phase_sweep, or Phase_idle */
@@ -861,14 +867,21 @@ asize_t caml_clip_heap_chunk_wsz (asize_t wsz)
   }
   return result;
 }
-
+#define HEAP_RESERVE_SIZE (1UL << 40) /* 1Tb */
 /* [heap_size] is a number of bytes */
 void caml_init_major_heap (asize_t heap_size)
 {
   int i;
+#ifdef NO_PAGE_TABLE
+  caml_heap_base = caml_mem_map(HEAP_RESERVE_SIZE, HEAP_RESERVE_SIZE, 1 /* reserve only */);
+  if(caml_heap_base == NULL)
+    caml_fatal_error("cannot reserve heap region");
+  caml_heap_reserve_end = caml_heap_base + HEAP_RESERVE_SIZE;
+  caml_heap_end = caml_heap_base;
+#endif
 
   Caml_state->stat_heap_wsz =
-    caml_clip_heap_chunk_wsz (Wsize_bsize (heap_size));
+      caml_clip_heap_chunk_wsz(Wsize_bsize(heap_size));
   Caml_state->stat_top_heap_wsz = Caml_state->stat_heap_wsz;
   CAMLassert (Bsize_wsize (Caml_state->stat_heap_wsz) % Page_size == 0);
   caml_heap_start =
@@ -880,11 +893,13 @@ void caml_init_major_heap (asize_t heap_size)
   Caml_state->stat_heap_chunks = 1;
   Caml_state->stat_top_heap_wsz = Caml_state->stat_heap_wsz;
 
+#ifndef NO_PAGE_TABLE
   if (caml_page_table_add(In_heap, caml_heap_start,
         caml_heap_start + Bsize_wsize (Caml_state->stat_heap_wsz))
       != 0) {
     caml_fatal_error ("cannot allocate initial page table");
   }
+#endif
 
   caml_fl_init_merge ();
   caml_make_free_blocks ((value *) caml_heap_start,
